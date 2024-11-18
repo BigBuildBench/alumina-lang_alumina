@@ -1,0 +1,51 @@
+use std::io::println;
+use std::builtins::{Array, ZeroSized, Numeric};
+use std::fmt::{Formattable, format};
+use std::typing::matches;
+use std::string::StringBuf;
+
+type element_type<T> = typeof({ let v: T; v[0] });
+
+fn last_element<T>(v: T) -> element_type<T> {
+    when (v is Array) && (v is ZeroSized) {
+        // We want to allow e.g. [(); 42], where the whole array is still zero-sized but has
+        // a non-zero length.
+        when !(v[0] is ZeroSized) {
+            compile_fail!("Cannot get the last element of a zero-length array");
+        }
+    }
+
+    v[v.len() - 1]
+}
+
+fn plus<T: Numeric | Formattable<T>>(lhs: T, rhs: T) -> when typing::is_numeric::<T>() { T } else { StringBuf } {
+    when lhs is Numeric {
+        lhs + rhs
+    } else {
+        format!("{}{}", lhs, rhs).unwrap()
+    }
+}
+
+
+fn main() {
+    let a = 10usize;
+    let _: typeof(a) = 12; // = 12usize;
+
+    /// Works for fixed-size arrays
+    println!("last int:    {}", [1,2,3,4,5].last_element());
+    println!("last string: {}", ["Hello", "World"].last_element());
+
+    // And for slices
+    let values: &[bool] = &[true, true, false];
+    println!("last bool: {}", last_element(values));
+
+    // This works...
+    let _ = [(), (), ()].last_element();
+
+    // ... but this would be a compile-time error:
+    // let zst: [i32; 0] = [];
+    // println!("{}", last_element(zst));
+
+    println!("10 + 10 = {}", 10.plus(10));
+    println!("\"hello\" + \"world\" = {}", "hello".plus("world"));
+}

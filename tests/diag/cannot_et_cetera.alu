@@ -1,0 +1,8 @@
+//! exit_code: 1
+macro foo($a...) {
+    1 + $a...  // diag: error(et_cetera_expr_in_unsupported): "... can only be used inside a tuple"
+}
+
+fn main() {
+    println!("{}", foo!(1, 2, 3));
+}

@@ -1,0 +1,455 @@
+//! Markdown-ish renderer.
+
+use std::string::{split, StringBuf, starts_with, trim_prefix, trim_start, trim};
+use std::fmt::{Formatter, Formattable, Result, write, writeln, Error};
+use alumina_doc::common::{LinkContext, Path, DoctestWriter};
+
+enum State {
+    Normal,
+    MaybeItalic,
+    Italic,
+    BoldEnd,
+    Bold,
+    Code,
+    LinkTitle,
+    LinkUrlStart,
+    LinkUrl,
+}
+
+struct InlineMarkdownState {
+    kind: State,
+    link_text: StringBuf,
+    link_url: StringBuf,
+}
+
+impl InlineMarkdownState {
+    fn default() -> InlineMarkdownState {
+        InlineMarkdownState {
+            kind: State::Normal,
+            link_text: StringBuf::new(),
+            link_url: StringBuf::new()
+        }
+    }
+
+    fn reset(self: &mut InlineMarkdownState) -> ::Result<(), Error> {
+        if self.kind != State::Normal {
+            return Result::err(Error::new())
+        }
+        self.free();
+        *self = InlineMarkdownState::default();
+        Result::ok(())
+    }
+
+    fn move(self: &mut InlineMarkdownState) -> InlineMarkdownState {
+        InlineMarkdownState {
+            kind: self.kind,
+            link_text: self.link_text.move(),
+            link_url: self.link_url.move()
+        }
+    }
+
+    fn free(self: &mut InlineMarkdownState) {
+        self.link_text.free();
+        self.link_url.free();
+    }
+}
+
+/// A very tiny subset of Markdown is supported, just inline code, bold, italic and links
+/// without nesting.
+struct InlineMarkdown {
+    inner: &[u8],
+    state: &mut InlineMarkdownState,
+    link_context: &LinkContext,
+}
+
+impl InlineMarkdown {
+    fn new(inner: &[u8], state: &mut InlineMarkdownState, link_context: &LinkContext) -> InlineMarkdown {
+        InlineMarkdown {
+            inner: inner,
+            state: state,
+            link_context: link_context,
+        }
+    }
+
+    fn write_link<F: Formatter<F>>(self: &InlineMarkdown, f: &mut F) -> Result {
+        let (text, link, class) = if self.state.link_url.is_empty() {
+            (
+                self.state.link_text.as_slice().split("::").last().unwrap(),
+                self.state.link_text.as_slice(),
+                "path-link"
+            )
+        } else {
+            (self.state.link_text.as_slice(), self.state.link_url.as_slice(), "")
+        };
+
+        let link = if link.starts_with("http") {
+            link
+        } else {
+            let path = Path::from_str(link);
+            defer path.free();
+            let link = self.link_context.resolve_link(&path, false);
+            let link = if !link.is_some() {
+                eprintln!("Could not resolve link: {}", path);
+                return Result::err(Error::new());
+            } else {
+                link.unwrap()
+            };
+            defer link.free();
+
+            link.as_slice()
+        };
+
+        write!(f,
+            "<a class=\"{}\" href=\"{}\">{}</a>",
+            class,
+            link,
+            HtmlEscaped::str(text)
+        )?;
+
+        self.state.link_url.clear();
+        self.state.link_text.clear();
+
+        Result::ok(())
+    }
+
+    fn fmt<F: Formatter<F>>(self: &InlineMarkdown, f: &mut F) -> Result {
+        use std::fmt::write;
+
+        for ch in self.inner {
+            switch self.state.kind {
+                State::Normal => switch ch {
+                    '*' => self.state.kind = State::MaybeItalic,
+                    '`' => {
+                        write!(f, "<code class=\"language-alumina\">")?;
+                        self.state.kind = State::Code;
+                    },
+                    '[' => self.state.kind = State::LinkTitle,
+                    _ => write!(f, "{}", HtmlEscaped::char(&ch))?,
+                },
+                State::MaybeItalic => switch ch {
+                    '*' => {
+                        self.state.kind = State::Bold;
+                        write!(f, "<b>")?;
+                    }
+                    _ => {
+                        self.state.kind = State::Italic;
+                        write!(f, "<i>")?;
+                        write!(f, "{}", HtmlEscaped::char(&ch))?;
+                    }
+                },
+                State::Italic => switch ch {
+                    '*' => {
+                        write!(f, "</i>")?;
+                        self.state.kind = State::Normal;
+                    },
+                    _ => write!(f, "{}", HtmlEscaped::char(&ch))?,
+                },
+                State::Bold => switch ch {
+                    '*' => {
+                        write!(f, "</b>")?;
+                        self.state.kind = State::BoldEnd;
+                    },
+                    _ => write!(f, "{}", HtmlEscaped::char(&ch))?,
+                },
+                State::BoldEnd => switch ch {
+                    '*' => {
+                        self.state.kind = State::Normal;
+                    },
+                    _ => return Result::err(Error::new())
+                },
+                State::Code => switch ch {
+                    '`' => {
+                        write!(f, "</code>")?;
+                        self.state.kind = State::Normal;
+                    },
+                    _ => write!(f, "{}", HtmlEscaped::char(&ch))?,
+                },
+                State::LinkTitle => switch ch {
+                    ']' => self.state.kind = State::LinkUrlStart,
+                    _ => self.state.link_text.push(ch),
+                },
+                State::LinkUrlStart => switch ch {
+                    '(' => self.state.kind = State::LinkUrl,
+                    _ => {
+                        self.write_link(f)?;
+                        write!(f, "{}", HtmlEscaped::char(&ch))?;
+                        self.state.kind = State::Normal;
+                    },
+                },
+                State::LinkUrl => switch ch {
+                    ')' => {
+                        self.write_link(f)?;
+                        self.state.kind = State::Normal;
+                    },
+                    _ => self.state.link_url.push(ch),
+                },
+            }
+        }
+
+        Result::ok(())
+    }
+}
+
+struct HtmlEscaped {
+    inner: &[u8]
+}
+
+impl HtmlEscaped {
+    fn str(inner: &[u8]) -> HtmlEscaped {
+        HtmlEscaped { inner: inner }
+    }
+
+    fn char(inner: &u8) -> HtmlEscaped {
+        HtmlEscaped { inner: std::mem::slice::from_raw(inner, 1) }
+    }
+
+    fn fmt<F: Formatter<F>>(self: &HtmlEscaped, f: &mut F) -> Result {
+        for ch in self.inner {
+            switch ch {
+                '&' => f.write_str("&amp;")?,
+                '<' => f.write_str("&lt;")?,
+                '>' => f.write_str("&gt;")?,
+                _ => f.write_byte(ch)?
+            }
+        }
+
+        Result::ok(())
+    }
+}
+
+
+/// A hacky mini-markdown subset parser
+fn write_docstring<T: std::io::Writable<T>>(
+    writer: &mut T,
+    doc_comment: &[u8],
+    tagline_only: bool,
+    link_context: &LinkContext,
+    doctest_item: &common::Item,
+    doctest_writer: &mut DoctestWriter
+) -> Result {
+    if doc_comment.len() == 0 {
+        return Result::ok(());
+    }
+
+    // Redirects
+    if doc_comment.starts_with("/// @") {
+        let path = Path::from_str(doc_comment.trim_prefix("/// @").trim());
+        defer path.free();
+
+        let item = link_context.item_bag.resolve(link_context.path, &path, true).unwrap();
+        let link_context = LinkContext::new(link_context.item_bag, &item.defined_in);
+
+        return write_docstring(
+            writer,
+            item.doc_comment.as_slice(),
+            tagline_only,
+            &link_context,
+            null, // Redirects should not have additional doctests
+            doctest_writer
+        );
+    }
+
+    if !tagline_only {
+        writeln!(writer, "<p>")?;
+    }
+
+    enum CodeBlockType {
+        Default,        // Fully tested and expected to succeed
+        NotAlumina,     // Not Alumina code. No playground link, no doctest, no syntax highlighting
+        PseudoAlumina,  // Pseudo-Alumina code. Just syntax highlighting but nothing else
+        NoTest,         // Not tested
+        NoRun,          // Test just compiled, but not run
+        Panics,         // Fully tested and expected to panic
+        Dubious,        // Valid Alumina code, but may produce unexpected results
+        NasalDemons,    // Compiles, but produces undefined behavior
+        CompileFail,    // Invalid alumina code. Expected to fail to compile
+        Bare,           // Playground link without fn main() { ... } wrapper. Not tested.
+    }
+
+    let in_a_code_block = false;
+    let cb_type = CodeBlockType::Default;
+
+    let md_state = InlineMarkdownState::default();
+    defer md_state.free();
+
+    let doctest_source = StringBuf::new();
+    defer doctest_source.free();
+
+    let num_lines = doc_comment.split("\n").count();
+    let doctest_start: Option<usize> = Option::none();
+
+    for (line_num, i) in doc_comment.split("\n").enumerate() {
+        let docline =  if i.starts_with("///") {
+            i.trim_prefix("///").trim_prefix(" ")
+        } else {
+            i.trim_prefix("//!").trim_prefix(" ")
+        };
+
+        if docline.trim().starts_with("```") {
+            if in_a_code_block {
+                if !tagline_only &&
+                    cb_type != CodeBlockType::NotAlumina &&
+                    cb_type != CodeBlockType::PseudoAlumina &&
+                    cb_type != CodeBlockType::NoTest &&
+                    cb_type != CodeBlockType::CompileFail &&
+                    cb_type != CodeBlockType::Bare {
+                    use std::string::join;
+
+                    if doctest_item != null && doctest_item.path == doctest_item.defined_in {
+                        let name = "_".join(&doctest_item.defined_in.as_slice().iter());
+                        doctest_writer.write_test(
+                            name.as_slice(),
+                            doctest_source.as_slice(),
+                            cb_type == CodeBlockType::NoRun || cb_type == CodeBlockType::NasalDemons,
+                            cb_type == CodeBlockType::Panics,
+                            doctest_item.parse_context.filename[..],
+                            // We assume that the docstring is contiguous (no empty or other comment lines in between)
+                            // and that the item is directly after the docstring. This is not exact, but we cannot
+                            // really do better than that easily.
+                            doctest_item.node.start_point().row as usize + doctest_start.unwrap() - num_lines
+                        );
+                        name.free();
+                    }
+
+                }
+                write!(writer, "</code>")?;
+
+                if !tagline_only &&
+                    cb_type != CodeBlockType::NotAlumina &&
+                    cb_type != CodeBlockType::PseudoAlumina {
+                    let code = StringBuf::new();
+                    let parts: &[&[u8]] = if cb_type == CodeBlockType::Bare {
+                        [doctest_source.as_slice()].as_slice()
+                    } else {
+                        ["fn main() {\n", doctest_source.as_slice(), "}\n"].as_slice()
+                    };
+
+                    for part in parts {
+                        for c in part {
+                            use std::fmt::hex;
+                            if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' {
+                                code.push(c);
+                            } else {
+                                write!(&code, "%{}", c.hex().zero_pad(2))?;
+                            }
+                        }
+                    }
+
+                    write!(
+                        writer,
+                        "<a class=\"playground-link\" target=\"_blank\" href=\"{}?q={}\">Run this example</a>",
+                        std::process::env()
+                            .get("ALUMINA_DOC_PLAYGROUND_URL")
+                            .unwrap_or("https://play.alumina-lang.net/"),
+                        code
+                    )?;
+                    code.free();
+                }
+
+                writeln!(writer, "</pre>")?;
+            } else {
+                doctest_start = Option::some(line_num);
+                doctest_source.clear();
+                cb_type = switch docline.trim() {
+                    "```not_alumina" => CodeBlockType::NotAlumina,
+                    "```pseudo_alumina" => CodeBlockType::PseudoAlumina,
+                    "```no_test" => CodeBlockType::NoTest,
+                    "```no_run" => CodeBlockType::NoRun,
+                    "```compile_fail" => CodeBlockType::CompileFail,
+                    "```panics" => CodeBlockType::Panics,
+                    "```dubious" => CodeBlockType::Dubious,
+                    "```nasaldemons" => CodeBlockType::NasalDemons,
+                    "```bare" => CodeBlockType::Bare,
+                    _ => CodeBlockType::Default,
+                };
+
+                if tagline_only || cb_type == CodeBlockType::NotAlumina {
+                    write!(writer, "<pre>")?;
+                } else if cb_type == CodeBlockType::Panics
+                    || cb_type == CodeBlockType::CompileFail
+                    || cb_type == CodeBlockType::NasalDemons {
+                    write!(writer, "<pre class=\"with-playground-link panics\">")?;
+                } else if cb_type == CodeBlockType::Dubious {
+                    write!(writer, "<pre class=\"with-playground-link dubious\">")?;
+                } else {
+                    write!(writer, "<pre class=\"with-playground-link\">")?;
+                }
+
+                if cb_type == CodeBlockType::NotAlumina {
+                    write!(writer, "<code>")?;
+                } else {
+                    write!(writer, "<code class=\"language-alumina\">")?;
+                }
+            };
+            in_a_code_block = !in_a_code_block;
+        } else if !in_a_code_block {
+            docline = docline.trim_start();
+            if docline.len() == 0 {
+                md_state.reset()?;
+                if tagline_only {
+                    return Result::ok(());
+                } else {
+                    writeln!(writer, "</p><p>")?;
+                }
+            } else if docline.starts_with("###") {
+                md_state.reset()?;
+                writeln!(writer, "</p>")?;
+                writeln!(writer, "<h4>{}</h4>", InlineMarkdown::new(
+                    docline.trim_prefix("###"), &md_state,
+                    link_context
+                ))?;
+                md_state.reset()?;
+                writeln!(writer, "<p>")?;
+            } else if docline.starts_with("##") {
+                md_state.reset()?;
+                writeln!(writer, "</p>")?;
+                writeln!(writer, "<h3>{}</h3>", InlineMarkdown::new(
+                    docline.trim_prefix("##"), &md_state,
+                    link_context
+                ))?;
+                md_state.reset()?;
+                writeln!(writer, "<p>")?;
+            } else if docline.starts_with("#!") {
+                md_state.reset()?;
+                writeln!(writer, "</p>")?;
+                writeln!(writer, "<h1>{}</h1>", InlineMarkdown::new(
+                    docline.trim_prefix("#!"), &md_state,
+                    link_context
+                ))?;
+                md_state.reset()?;
+                writeln!(writer, "<p>")?;
+            } else if docline.starts_with("#") {
+                md_state.reset()?;
+                writeln!(writer, "</p>")?;
+                writeln!(writer, "<h2>{}</h2>", InlineMarkdown::new(
+                    docline.trim_prefix("#"), &md_state,
+                    link_context
+                ))?;
+                md_state.reset()?;
+                writeln!(writer, "<p>")?;
+            } else {
+                writeln!(writer, "{}", InlineMarkdown::new(
+                    docline,
+                    &md_state,
+                    link_context
+                ))?;
+            }
+        } else {
+            if cb_type == CodeBlockType::Bare {
+                writeln!(&doctest_source, "{}", docline)?;
+            } else {
+                writeln!(&doctest_source, "    {}", docline)?;
+            }
+            writeln!(writer, "{}", HtmlEscaped::str(docline))?;
+        }
+    }
+
+    if in_a_code_block {
+        return Result::err(Error::new());
+    }
+
+    if !tagline_only {
+        writeln!(writer, "</p>")?;
+    }
+    Result::ok(())
+}

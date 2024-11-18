@@ -1,0 +1,175 @@
+name: Build Alumina
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  lint:
+    name: Lint rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+          components: rustfmt, clippy
+      - name: Install Tree-sitter
+        run: npm install -g tree-sitter-cli
+
+      - name: Lint Rust
+        timeout-minutes: 10
+        run: make lint-rust
+
+  tests:
+    name: Build and test (base only)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+          components: rustfmt, clippy
+      - name: Install Tree-sitter
+        run: npm install -g tree-sitter-cli
+
+      - name: Install libbacktrace
+        if: matrix.os == 'macos-latest'
+        run: |
+          git clone https://github.com/ianlancetaylor/libbacktrace
+          cd libbacktrace
+          ./configure
+          make -j8
+          sudo make install
+
+      - name: Run all tests
+        timeout-minutes: 10
+        run: make test -j8
+
+  tests-musl:
+    name: Build and test (alpine)
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:latest
+
+    steps:
+      - uses: actions/checkout@v2
+      - name: Set up packages
+        run: apk add --no-cache gcc musl-dev make nodejs npm curl git
+
+      - name: Install Rust
+        run:  |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install Tree-sitter
+        run: cargo install tree-sitter-cli
+
+      - name: Install libbacktrace
+        run: |
+          git clone https://github.com/ianlancetaylor/libbacktrace
+          cd libbacktrace
+          ./configure
+          make -j8
+          make install
+
+      - name: Run all tests
+        timeout-minutes: 10
+        run: make test -j8
+
+  dist-check:
+    name: Build and test (full)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cache_ast: [with-ast-cache, without-ast-cache]
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+          components: rustfmt, clippy
+
+      - name: Install Tree-sitter (with runtime)
+        run: |
+          npm install -g tree-sitter-cli
+          curl -fsSL https://github.com/tree-sitter/tree-sitter/archive/refs/tags/v0.23.0.tar.gz | tar -xz
+          cd tree-sitter-*
+          make
+          sudo make install
+          sudo ldconfig
+
+      - name: Build full
+        run: make dist-check -j8
+        if: ${{ matrix.cache_ast == 'without-ast-cache' }}
+
+      - name: Build full (with AST cache)
+        run: make dist-check -j8
+        if: ${{ matrix.cache_ast == 'with-ast-cache' }}
+        env:
+          CACHE_AST: 1
+
+  code-coverage:
+    name: Collect code coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+          components: rustfmt, clippy
+
+      - name: Install LLVM
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 18
+          sudo apt-get install -y llvm-18 llvm-18-dev clang-tools-18
+
+      - name: Install Tree-sitter (with runtime)
+        run: |
+          npm install -g tree-sitter-cli
+          curl -fsSL https://github.com/tree-sitter/tree-sitter/archive/refs/tags/v0.23.0.tar.gz | tar -xz
+          cd tree-sitter-*
+          make
+          sudo make install
+          sudo ldconfig
+
+      - name: Install rustfilt
+        run: cargo install rustfilt
+
+      - name: Build dist-check with coverage
+        timeout-minutes: 10
+        run: CC=clang-18 LLVM_SUFFIX=-18 make coverage -j8
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./build/coverage/coverage.txt
+          fail_ci_if_error: true
+
+
+  docker:
+    name: Build docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - run: docker build .

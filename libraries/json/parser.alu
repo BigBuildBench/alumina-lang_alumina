@@ -1,0 +1,270 @@
+//! JSON parsing functionality.
+
+use std::iter::{Iterator, PeekableIterator};
+use std::io::BufferedReadable;
+use json::reader::{Token, TokenKind, JsonReader};
+use json::{Result, Error};
+
+/// JSON parser
+///
+/// This parser takes an iterator of raw tokens from a lexer or another source and converts them
+/// into a [JsonValue]. Meant to be used in tandem with [reader::JsonReader].
+///
+/// The parser does not consume the iterator, so it can be used to parse multiple JSON values from
+/// the same source (e.g. a stream of JSON values, such as JSON Lines)
+struct JsonParser<It: Iterator<It, Result<Token>>> {
+    iter: PeekableIterator<It, Result<Token>>
+}
+
+impl JsonParser<It: Iterator<It, Result<Token>>> {
+    fn new(iter: &mut It) -> JsonParser<It> {
+        JsonParser { iter: iter.peekable() }
+    }
+
+    fn parse(self: &mut JsonParser<It>) -> Result<JsonValue> {
+        let kind = self._peek_kind!();
+        switch kind {
+            Option::some(TokenKind::Number) => self.parse_number(),
+            Option::some(TokenKind::Literal) => self.parse_literal(),
+            Option::some(TokenKind::String) => self.parse_string(),
+            Option::some(TokenKind::ArrOpen) => self.parse_array(),
+            Option::some(TokenKind::ObjOpen) => self.parse_object(),
+
+            Option::none() => return Result::err(Error::new(ErrorKind::Eof)),
+            _ => return Result::err(Error::unexpected_token(kind.unwrap()))
+        }
+    }
+
+    fn parse_number(self: &mut JsonParser<It>) -> Result<JsonValue> {
+        let token = self._expect_token!(TokenKind::Number);
+        let value = f64::parse(token.value[..]).ok_or_else(|| -> Error { Error::new(ErrorKind::InvalidNumber) })?;
+
+        Result::ok(JsonValue::number(value))
+    }
+
+    fn parse_literal(self: &mut JsonParser<It>) -> Result<JsonValue> {
+        let token = self._expect_token!(TokenKind::Literal);
+
+        let value = switch token.value[..] as &[u8] {
+            "true" => JsonValue::boolean(true),
+            "false" => JsonValue::boolean(false),
+            "null" => JsonValue::null(),
+            _ => unreachable!()
+        };
+
+        Result::ok(value)
+    }
+
+    fn parse_string(self: &mut JsonParser<It>) -> Result<JsonValue> {
+        let token = self._expect_token!(TokenKind::String);
+
+        let read = reader::unescape_string(token.value[..])?;
+
+        // Steal the buffer from the token
+        let value = token.value.move();
+        value.truncate(read);
+
+        Result::ok(JsonValue::string(value))
+    }
+
+    fn parse_array(self: &mut JsonParser<It>) -> Result<JsonValue> {
+        self._expect_token!(TokenKind::ArrOpen);
+
+        let values: Vector<JsonValue> = Vector::new();
+        defer values.free_all();
+
+        loop {
+            switch self._peek_kind!() {
+                Option::some(TokenKind::ArrClose) => {
+                    self.iter.next().transpose()?;
+                    break;
+                },
+                Option::some(TokenKind::Comma) => {
+                    self.iter.next().transpose()?;
+                    // Trailing comma not allowed
+                    let value = self.parse()?;
+                    values.push(value);
+                },
+                _ => {
+                    let value = self.parse()?;
+                    values.push(value);
+                }
+            }
+        }
+
+        Result::ok(JsonValue::array(values.move()))
+    }
+
+    fn parse_object(self: &mut JsonParser<It>) -> Result<JsonValue> {
+        self._expect_token!(TokenKind::ObjOpen);
+
+        let properties: HashMap<StringBuf, JsonValue> = HashMap::new();
+        defer properties.free_all();
+
+        loop {
+            switch self._peek_kind!() {
+                Option::some(TokenKind::ObjClose) => {
+                    self.iter.next().transpose()?;
+                    break;
+                },
+                Option::some(TokenKind::Comma) => {
+                    self.iter.next().transpose()?;
+                    // Trailing comma not allowed
+                    let (key, value) = self.parse_property()?;
+                    properties.insert(key, value);
+                },
+                _ => {
+                    let (key, value) = self.parse_property()?;
+                    properties.insert(key, value);
+                }
+            }
+        }
+
+        Result::ok(JsonValue::object(properties.move()))
+    }
+
+    fn parse_property(self: &mut JsonParser<It>) -> Result<(StringBuf, JsonValue)> {
+        let key = self.parse_string()?;
+        defer key.free();
+        self._expect_token!(TokenKind::Colon);
+        let value = self.parse()?;
+
+        Result::ok((key.as_string_mut().unwrap().move(), value))
+    }
+}
+
+
+fn _get_kind(token: Token) -> TokenKind {
+    token.kind
+}
+
+macro _expect_token($self, $kind) {
+    let token = $self.iter.next().transpose()?;
+    switch token.map(_get_kind) {
+        Option::some($kind) => token.unwrap(),
+        Option::none() => return Result::err(Error::new(ErrorKind::Eof)),
+        _ => return Result::err(Error::unexpected_token(token.unwrap().kind))
+    }
+}
+
+macro _peek_kind($self) {
+    $self.iter.peek().transpose()?.map(_get_kind)
+}
+
+
+#[docs(hide)]
+#[cfg(test)]
+mod tests {
+    use std::io::SliceReader;
+    use json::builder::{object, array, into};
+
+    macro chk($str, $expected) {
+        let expected = $expected;
+        defer expected.free();
+
+        let reader = SliceReader::new($str);
+        let iter = JsonReader::new(&reader);
+        defer iter.free();
+
+        let parser = JsonParser::new(&iter);
+
+        let result = parser.parse();
+        assert_eq!(result.unwrap(), expected);
+    }
+
+    macro chk_err($str, $expected_err_kind) {
+        let reader = SliceReader::new($str);
+        let iter = JsonReader::new(&reader);
+        defer iter.free();
+
+        let parser = JsonParser::new(&iter);
+
+        let result = parser.parse();
+        assert_eq!(result.unwrap_err().kind(), $expected_err_kind);
+    }
+
+    #[test]
+    fn test_parse_string() {
+        chk!("\"hello\"", "hello".into!());
+        chk!("\"hello\\nworld\"", "hello\nworld".into!());
+        // unicode escapes
+        chk!("\"hello\\u0020world\"", "hello world".into!());
+        chk!("\"hello\\u0000world\"", "hello\0world".into!());
+
+        // non-BMP codepoints
+        chk!("\"hello\\uD83D\\uDE00world\"", "hello😀world".into!());
+        chk!("\"hello\\ud83d\\ude00world\"", "hello😀world".into!());
+
+        // invalid escapes
+        chk_err!("\"hello\\x\"", ErrorKind::Unexpected);
+        chk_err!("\"hello\\u\"", ErrorKind::Unexpected);
+        chk_err!("\"hello\\u0\"", ErrorKind::Unexpected);
+        chk_err!("\"hello\\u00\"", ErrorKind::Unexpected);
+        chk_err!("\"hello\\u000\"", ErrorKind::Unexpected);
+
+        // newline in string
+        chk_err!("\"hello\nworld\"", ErrorKind::Unexpected);
+
+        // unmatched surrogate
+        chk_err!("\"hello\\uD83D\"", ErrorKind::InvalidUnicodeEscape);
+        // something else before the second surrogate
+        chk_err!("\"hello\\uD83D \\uDE00\"", ErrorKind::InvalidUnicodeEscape);
+        chk_err!("\"hello\\uD83D\\n\\uDE00\"", ErrorKind::InvalidUnicodeEscape);
+        // invalid UTF-16
+        chk_err!("\"hello\\uDE00\\uD83Dworld\"", ErrorKind::InvalidUnicodeEscape);
+    }
+
+    #[test]
+    fn test_parse_literal() {
+        chk!("true", true.into!());
+        chk!("false", false.into!());
+        chk!("null", ().into!());
+    }
+
+    #[test]
+    fn test_parse_array() {
+        chk!("[]", array!());
+        chk!("[42]", array!(42));
+        chk!("[42, 43, true]", array!(42, 43, true));
+    }
+
+    #[test]
+    fn test_parse_object() {
+        chk!("{}", object!());
+        chk!("{\"a\": 42}", object!(
+            ("a", 42)
+        ));
+
+        chk!("{\"a\": 42, \"b\": 43}", object!(
+            ("a", 42),
+            ("b", 43)
+        ));
+
+    }
+
+    #[test]
+    fn test_complex() {
+        chk!(
+            "{\"a\": 42,\"b\": [1, 2, 3],\"c\": {\"d\": true,\"e\": false}}",
+            object!(
+                ("a", 42),
+                ("b", array!(1, 2, 3)),
+                ("c", object!(
+                    ("d", true),
+                    ("e", false)
+                ))
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_error() {
+        chk_err!("", ErrorKind::Eof);
+        chk_err!("{", ErrorKind::Eof);
+        chk_err!("[", ErrorKind::Eof);
+        chk_err!("[42,", ErrorKind::Eof);
+        chk_err!("[42,]", ErrorKind::UnexpectedToken);
+        chk_err!("{\"hello\" 42}", ErrorKind::UnexpectedToken);
+        chk_err!("\"\\+\"", ErrorKind::Unexpected);
+    }
+}

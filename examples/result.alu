@@ -1,0 +1,24 @@
+use std::random::thread_rng;
+use std::result::{Result, try};
+
+fn try_get_number() -> Result<i32, ()> {
+    let val = thread_rng().next(0..3);
+
+    if val > 0 {
+        Result::ok(val)
+    } else {
+        Result::err(())
+    }
+}
+
+fn try_cast() -> Result<i64, ()> {
+    let value = try_get_number()?;
+
+    Result::ok(value as i64)
+}
+
+fn main() {
+    let ok = try_cast();
+
+    println!("value: {}", ok.unwrap());
+}

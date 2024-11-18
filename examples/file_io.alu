@@ -1,0 +1,45 @@
+use std::fs::{File, Path};
+use std::io::{Error, Readable, Writable};
+
+fn copy<S: Readable<S>, D: Writable<D>>(
+    src: &mut S,
+    dst: &mut D
+) -> Result<(), Error> {
+    let buf: [u8; 1024];
+
+    loop {
+        let n = src.read(&buf)?;
+        if n == 0 {
+            break;
+        }
+        dst.write_all(buf[0..n])?;
+    }
+
+    dst.flush()
+}
+
+fn copy_file(src: Path, dst: Path) -> Result<(), Error> {
+    let src = File::open(src)?;
+    defer src.close();
+
+    let dst = File::create(dst)?;
+    defer dst.close();
+
+    copy(&src, &dst)?;
+
+    Result::ok(())
+}
+
+fn main() -> i32 {
+    let ret = copy_file(
+        Path::new("/proc/mounts"),
+        Path::new("./mounts.txt")
+    );
+
+    if ret.is_err() {
+        eprintln!("failed: {}", ret.unwrap_err());
+        1
+    } else {
+        0
+    }
+}

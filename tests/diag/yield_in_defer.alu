@@ -1,0 +1,10 @@
+//! exit_code: 1
+fn* gen() {  // diag: error(coroutine_return_type): "coroutines must have Coroutine<_, _> as return type"
+    defer {
+        yield
+    }
+}
+
+fn main() {
+    gen();
+}

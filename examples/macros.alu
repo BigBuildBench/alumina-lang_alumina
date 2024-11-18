@@ -1,0 +1,84 @@
+fn printf_impl(fmt: &[u8], args: &[&void]) {
+    let i = 0usize;
+    let buf: [u8; 32];
+    let buf: &mut [u8] = &buf;
+
+    let buf_pos = 0usize;
+    let in_escape = false;
+
+    // Macros are hygienic, but if defined in linear scopes,
+    // they can bind ambient variables (like buf, buf_pos here)
+    macro buf_append($val) {
+        buf[buf_pos] = $val;
+        buf_pos += 1;
+        if buf_pos == buf.len() {
+            print!("{}", buf);
+            buf_pos = 0;
+        }
+    }
+
+    macro pop_arg() {
+        if args.len() == 0 {
+            panic!("too few arguments");
+        }
+        let arg = args[0];
+        args = args[1..];
+        arg
+    }
+
+    while i < fmt.len() {
+        let ch = fmt[i];
+        if in_escape {
+            switch ch {
+                's' => {
+                    print!("{}", buf[0..buf_pos]);
+                    print!("{}", *(pop_arg!() as &&[u8]));
+                    buf_pos = 0;
+                }
+                'd' => {
+                    print!("{}", buf[0..buf_pos]);
+                    print!("{}", *(pop_arg!() as &i32));
+                    buf_pos = 0;
+                }
+                '%' => {
+                    buf_append!(ch);
+                }
+                _ => {
+                    panic!("unknown escape code")
+                }
+            }
+            in_escape = false;
+        } else {
+            if ch == '%' {
+                in_escape = true;
+            } else {
+                buf_append!(ch);
+            }
+        }
+        i += 1;
+    }
+
+    print!("{}", buf[0..buf_pos]);
+
+    if args.len() > 0 {
+        panic!("too many arguments");
+    }
+}
+
+macro printf($fmt, $expr...) {
+    printf_impl($fmt, &[(&$expr as &void)$...])
+}
+
+
+fn main() {
+    printf!(
+        "hello %s, you are %d years old, you have %d dogs and %d cats\n",
+        "user",
+        42,
+        3,
+        6
+    );
+
+    // Macros can also be invoked using universal call syntax
+    "%d + %d = %d\n".printf!(1, 2, 3);
+}

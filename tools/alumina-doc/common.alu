@@ -1,0 +1,671 @@
+use std::collections::Vector;
+use std::string::{split, StringBuf};
+
+use tree_sitter::{Node, Parser, Tree};
+use std::collections::HashMap;
+use std::cmp::sort_by_key;
+
+use aluminac::lib::arena::Arena;
+
+use alumina_doc::error::{Error, Result};
+
+struct Path {
+    segments: Vector<&[u8]>,
+}
+
+impl Path {
+    use std::fmt::{Formatter, write};
+    use std::cmp::{Comparable, Equatable, Ordering};
+    use std::hash::{Hashable, Hasher};
+
+    fn root() -> Path {
+        Path::new(Vector::new())
+    }
+
+    fn new(segments: Vector<&[u8]>) -> Path {
+        Path { segments: segments }
+    }
+
+    fn as_slice(self: &Path) -> &[&[u8]] {
+        self.segments.as_slice()
+    }
+
+    fn from_str(s: &[u8]) -> Path {
+        Path::new(
+            s.split("::")
+                .filter(|segment: &[u8]| -> bool { segment.len() > 0 })
+                .to_vector()
+        )
+    }
+
+    fn move(self: &mut Path) -> Path {
+        Path { segments: self.segments.move() }
+    }
+
+    fn extend_with(self: &Path, segment: &[u8]) -> Path {
+        let ret = self.clone();
+        ret.segments.push(segment);
+        ret
+    }
+
+    fn join_with(self: &Path, other: &Path) -> Path {
+        let ret = self.clone();
+        ret.segments.extend_from_slice(other.as_slice());
+        ret
+    }
+
+    fn push(self: &mut Path, segment: &[u8]) {
+        self.segments.push(segment);
+    }
+
+    fn len(self: &Path) -> usize {
+        self.segments.len()
+    }
+
+    fn starts_with(self: &Path, prefix: &Path) -> bool {
+        if self.segments.len() < prefix.segments.len() {
+            return false;
+        }
+        self[0..prefix.len()] == prefix[..]
+    }
+
+    fn pop(self: &mut Path) -> &[u8] {
+        self.segments.pop().unwrap()
+    }
+
+    fn free(self: &mut Path) {
+        self.segments.free();
+    }
+
+    fn fmt<F: Formatter<F>>(self: &Path, fmt: &mut F) -> std::fmt::Result {
+        use std::string::join_fmt;
+
+        if self.segments.is_empty() {
+            write!(fmt, "::")
+        } else {
+            write!(fmt, "{}", "::".join_fmt(&self.segments.iter()))
+        }
+    }
+
+    fn compare(self: &Path, other: &Path) -> Ordering {
+        self.as_slice().compare(&other.as_slice())
+    }
+
+    fn equals(self: &Path, other: &Path) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+
+    fn clone(self: &Path) -> Path {
+        Path { segments: self.segments.clone() }
+    }
+
+    fn last(self: &Path) -> Option<&[u8]> {
+        self.segments.iter().next_back()
+    }
+
+    fn hash<H: Hasher<H>>(self: &Path, hasher: &mut H) {
+        self.segments.as_slice().hash(hasher);
+    }
+
+    mixin Equatable<Path>;
+    mixin Comparable<Path>;
+    mixin<H: Hasher<H>> Hashable<Path, H>;
+}
+
+// Order of enum variants here determines the order of sections in the generated documentation.
+enum ItemKind {
+    Module,
+    Field,
+    Variant,
+    RequiredMethod,
+    ProvidedMethod,
+    Method,
+    BuiltinType,
+    Protocol,
+    Struct,
+    Function,
+    Union,
+    TypeDef,
+    Enum,
+    Macro,
+    Const,
+    Static,
+    Mixin
+}
+
+impl ItemKind {
+    fn fmt<F: std::fmt::Formatter<F>>(self: &ItemKind, f: &mut F) -> std::fmt::Result {
+        use std::fmt::write;
+
+        switch *self {
+            ItemKind::Module => write!(f, "Module"),
+            ItemKind::Function => write!(f, "Function"),
+            ItemKind::RequiredMethod => write!(f, "Required method"),
+            ItemKind::ProvidedMethod => write!(f, "Provided method"),
+            ItemKind::Method => write!(f, "Method"),
+            ItemKind::TypeDef => write!(f, "Type"),
+            ItemKind::Macro => write!(f, "Macro"),
+            ItemKind::Const => write!(f, "Const"),
+            ItemKind::Protocol => write!(f, "Protocol"),
+            ItemKind::Enum => write!(f, "Enum"),
+            ItemKind::Variant => write!(f, "Variant"),
+            ItemKind::Static => write!(f, "Static"),
+            ItemKind::Struct => write!(f, "Struct"),
+            ItemKind::BuiltinType => write!(f, "Builtin type"),
+            ItemKind::Field => write!(f, "Field"),
+            ItemKind::Union => write!(f, "Union"),
+            ItemKind::Mixin => write!(f, "Mixin"),
+            _ => unreachable!(),
+        }
+    }
+
+    fn has_own_page(self: &ItemKind) -> bool {
+        switch *self {
+            ItemKind::Module,
+            ItemKind::Protocol,
+            ItemKind::Enum,
+            ItemKind::Union,
+            ItemKind::Struct,
+            ItemKind::BuiltinType,
+            ItemKind::Macro => true,
+            _ => false,
+        }
+    }
+
+    fn is_indexed(self: &ItemKind) -> bool {
+        switch *self {
+            ItemKind::Mixin,
+            ItemKind::Field => false,
+            _ => true,
+        }
+    }
+
+
+    fn should_show_in_sidebar(self: &ItemKind) -> bool {
+        switch *self {
+            ItemKind::Mixin => false,
+            _ => true,
+        }
+    }
+
+    fn show_siblings(self: &ItemKind) -> bool {
+        switch *self {
+            ItemKind::Module,
+            ItemKind::Union,
+            ItemKind::Protocol,
+            ItemKind::Struct,
+            ItemKind::BuiltinType,
+            ItemKind::Enum => false,
+            _ => true,
+        }
+    }
+
+    fn show_source_link(self: &ItemKind) -> bool {
+        switch *self {
+            ItemKind::Field,
+            ItemKind::Mixin,
+            ItemKind::Variant => false,
+            _ => true,
+        }
+    }
+
+    fn show_signature(self: &ItemKind) -> bool {
+        switch *self {
+            ItemKind::Module,
+            ItemKind::BuiltinType => false,
+            _ => true,
+        }
+    }
+
+
+    fn equals(self: &ItemKind, other: &ItemKind) -> bool {
+        (*self as i32) == (*other as i32)
+    }
+
+    mixin std::cmp::Equatable<ItemKind>;
+}
+
+struct Item {
+    kind: ItemKind,
+    parse_context: &ParseContext,
+    path: Path,
+    cfg_index: usize,
+    hide_from_index: bool,
+    defined_in: Path,
+    doc_comment: StringBuf,
+    node: Node,
+    group_node: Option<Node>,
+    has_cfg: bool,
+}
+
+impl Item {
+    use ::Result;
+    use std::fmt::{Formatter, write, Error};
+
+    fn free(self: &mut Item) {
+        self.path.free();
+        self.defined_in.free();
+        self.doc_comment.free();
+    }
+
+    fn move(self: &mut Item) -> Item {
+        let ret = *self;
+        self.path.move();
+        self.defined_in.move();
+        self.doc_comment.move();
+        ret
+    }
+
+    /// Show re-exports only if the original item was defined in a submodule.
+    ///
+    /// Since Alumina does not have item visibility, this is a heuristic to determine
+    /// if the item should be shown.
+    fn is_public(self: &Item) -> bool {
+        use std::string::starts_with;
+
+        let loc = self.path.as_slice();
+        let def = self.defined_in.as_slice();
+
+        if loc.len() > 0 && loc[loc.len() - 1].starts_with("_") {
+            return false;
+        }
+
+        if loc == def {
+            return true;
+        } else if loc.len() >= 2 && loc[0] == "std" && loc[1] == "prelude"  {
+            // Special case for prelude
+            return true;
+        } else if  loc.len() >= def.len() {
+            return false;
+        }
+
+        let suffix_len = 0usize;
+        loop {
+            if suffix_len >= std::cmp::min(loc.len(), def.len()) {
+                break;
+            }
+
+            if loc[loc.len() - suffix_len - 1] == def[def.len() - suffix_len - 1]  {
+                suffix_len += 1;
+            } else {
+                break;
+            }
+        }
+
+        loc[0..loc.len() - suffix_len] == def[0..loc.len() - suffix_len]
+    }
+
+    fn fmt<F: Formatter<F>>(self: &Item, fmt: &mut F) -> Result<(), Error> {
+        if !self.doc_comment.is_empty() {
+            write!(fmt, "{}", self.doc_comment)?;
+        }
+
+        switch self.kind {
+            ItemKind::Module => write!(fmt, "module {}", self.name)?,
+            ItemKind::Function => write!(fmt, "function {}", self.name)?,
+            ItemKind::TypeDef => write!(fmt, "type {}", self.name)?,
+            ItemKind::Macro => write!(fmt, "macro {}", self.name)?,
+            ItemKind::Const => write!(fmt, "const {}", self.name)?,
+            ItemKind::Protocol => write!(fmt, "protocol {}", self.name)?,
+            ItemKind::Enum => write!(fmt, "enum {}", self.name)?,
+            ItemKind::Static => write!(fmt, "static {}", self.name)?,
+            ItemKind::Struct => write!(fmt, "struct {}", self.name)?,
+            ItemKind::Mixin => write!(fmt, "mixin {}", self.name)?,
+            _ => unreachable!()
+        };
+
+        write!(fmt, " in {}", self.path)?;
+        Result::ok(())
+    }
+}
+
+struct ItemBag {
+    arena: Arena,
+    items: Vector<&Item>,
+    lookup: HashMap<Path, &Item>,
+    aliases: HashMap<Path, Path>,
+    star_aliases: HashMap<Path, Path>,
+}
+
+impl ItemBag {
+    fn new() -> ItemBag {
+        ItemBag {
+            arena: Arena::new(),
+            items: Vector::new(),
+            lookup: HashMap::new(),
+            aliases: HashMap::new(),
+            star_aliases: HashMap::new(),
+        }
+    }
+
+    fn free(self: &mut ItemBag) {
+        for item in self.items {
+            (item as &mut Item).free();
+        }
+        for (k, v) in self.aliases.iter().chain(&self.star_aliases.iter()) {
+            k.free();
+            v.free()
+        }
+
+        self.items.free();
+        self.lookup.free();
+        self.arena.free();
+        self.aliases.free();
+        self.star_aliases.free();
+    }
+
+    fn move(self: &mut ItemBag) -> ItemBag {
+        ItemBag {
+            arena: self.arena.move(),
+            items: self.items.move(),
+            lookup: self.lookup.move(),
+            aliases: self.aliases.move(),
+            star_aliases: self.star_aliases.move(),
+        }
+    }
+
+    fn add_item(self: &mut ItemBag, item: Item) {
+        let ptr = self.arena.alloc(item);
+        self.items.push(ptr);
+        self.lookup.insert(item.path, ptr);
+    }
+
+    fn add_alias(self: &mut ItemBag, path: Path, destination: Path) {
+        self.aliases.insert(path, destination);
+    }
+
+    fn add_star_alias(self: &mut ItemBag, path: Path, destination: Path) {
+        self.star_aliases.insert(path, destination);
+    }
+
+    fn sort(self: &mut ItemBag) {
+        self.items
+            .as_slice_mut()
+            .sort_by_key(|it: &&Item| -> (&[&[u8]], i32, usize, &[u8]) {
+                use std::mem::slice::empty;
+
+                let item_loc = it.node.start_byte();
+                let start = it.path.as_slice();
+
+                if start.len() == 0 {
+                    (empty(), 0, item_loc, empty())
+                } else {
+                    (start[..start.len()-1], it.kind as i32, item_loc, start[start.len()-1])
+                }
+            });
+    }
+
+    fn get(self: &ItemBag, path: &Path) -> Option<&Item> {
+        self.lookup.get(path)
+    }
+
+    fn resolve(self: &ItemBag, scope: &Path, path: &Path, go_down: bool) -> Option<&Item> {
+        let joined = scope.join_with(path);
+        defer joined.free();
+
+        let proper = self.lookup.get(&joined);
+        if proper.is_some() {
+            return proper;
+        }
+
+        let alias = self.aliases.get(&joined);
+        if alias.is_some() {
+            return self.resolve(scope, &alias.unwrap(), true);
+        }
+
+        let star_alias = self.star_aliases.get(scope);
+        if star_alias.is_some() {
+            let maybe_resolved = self.resolve(&star_alias.unwrap(), path, false);
+            if maybe_resolved.is_some() {
+                return maybe_resolved;
+            }
+        }
+
+        if go_down {
+            let scope = scope.clone();
+            defer scope.free();
+
+            while scope.segments.len() > 0 {
+                scope.pop();
+                let resolved = self.resolve(&scope, path, false);
+                if resolved.is_some() {
+                    return resolved;
+                }
+            }
+        }
+
+        Option::none()
+    }
+
+    fn sync_reexport(self: &mut ItemBag, source: &Path, dst: &Path) {
+        let new_items: Vector<Item> = Vector::new();
+        defer new_items.free();
+
+        for i in self.items.iter() {
+            if !i.path.starts_with(dst) {
+                continue
+            }
+
+            let src_path = source.clone();
+            for s in i.path.as_slice()[dst.segments.len()..] {
+                src_path.push(s);
+            }
+
+            if !self.lookup.get(&src_path).is_some() {
+                new_items.push(Item {
+                    kind: i.kind,
+                    cfg_index: i.cfg_index,
+                    parse_context: i.parse_context,
+                    path: src_path.move(),
+                    defined_in: i.defined_in.clone(),
+                    hide_from_index: i.hide_from_index,
+                    doc_comment: i.doc_comment.clone(),
+                    group_node: i.group_node,
+                    has_cfg: i.has_cfg,
+                    node: i.node,
+                });
+            }
+
+            src_path.free();
+        }
+
+        for new_item in new_items.iter_mut() {
+            self.add_item(new_item.move());
+        }
+    }
+
+    fn resolve_all(self: &mut ItemBag) {
+        loop {
+            let insertion_count = 0;
+            for (src, _) in self.aliases {
+                let scope = src.clone();
+                let suffix = Path::from_str(scope.pop());
+
+                let resolved = self.resolve(&scope, &suffix, true);
+                if resolved.is_some() {
+                    let item = resolved.unwrap();
+                    if !self.lookup.get(&src).is_some() {
+                        insertion_count += 1;
+                        self.sync_reexport(&src, &item.defined_in);
+                    }
+                }
+
+                scope.free();
+                suffix.free();
+            }
+
+            if insertion_count == 0 {
+                break;
+            }
+        }
+    }
+
+    fn all(self: &ItemBag) -> std::mem::SliceIterator<&&Item> {
+        self.items.iter()
+    }
+
+    fn filtered<F: Fn(&Item) -> bool>(self: &ItemBag, func: F) -> Vector<&Item> {
+        self.items.iter().filter(func).to_vector()
+    }
+}
+
+struct ParseContext {
+    filename: std::fs::PathBuf,
+    _source: StringBuf,
+    tree: Tree,
+}
+
+impl ParseContext {
+    fn from_file(parser: &mut Parser, filename: std::fs::Path) -> Result<ParseContext> {
+        let source = std::fs::File::read_to_string(filename)
+            .map_err(Error::from::<std::io::Error>)?;
+        defer source.free();
+
+        let tree = parser.parse(source.as_slice());
+        defer tree.free();
+
+        Result::ok(ParseContext {
+            _source: source.move(),
+            tree: tree.move(),
+            filename: std::fs::PathBuf::from_path(filename)
+        })
+    }
+
+    fn source(self: &ParseContext) -> &[u8] {
+        self._source.as_slice()
+    }
+
+    fn root_node(self: &ParseContext) -> Node {
+        self.tree.root_node().unwrap()
+    }
+
+    fn free(self: &mut ParseContext) {
+        self._source.free();
+        self.tree.free();
+        self.filename.free();
+    }
+
+    fn move(self: &mut ParseContext) -> ParseContext {
+        ParseContext {
+            _source: self.source.move(),
+            tree: self.tree.move(),
+            filename: self.filename.move()
+        }
+    }
+}
+
+struct LinkContext {
+    item_bag: &ItemBag,
+    path: &Path,
+}
+
+impl LinkContext {
+    fn new(item_bag: &ItemBag, path: &Path) -> LinkContext {
+        LinkContext {
+            item_bag: item_bag,
+            path: path
+        }
+    }
+
+    fn link_for_item(self: &LinkContext, item: &Item, defined_in: bool, filename: bool) -> Option<StringBuf> {
+        use std::fmt::write;
+        use std::string::ends_with;
+
+        let path = if defined_in {
+            item.defined_in.clone()
+        } else {
+            item.path.clone()
+        };
+        defer path.free();
+
+        if !item.kind.has_own_page() {
+            std::assert!(!filename);
+
+            let name = path.pop();
+            let parent = self.item_bag.get(&path).unwrap();
+
+            let link = self.link_for_item(parent, defined_in, false).unwrap();
+            if item.cfg_index != 0 {
+                write!(&link, "#item.{}.{}", name, item.cfg_index).unwrap();
+            } else {
+                write!(&link, "#item.{}", name).unwrap();
+            }
+            return Option::some(link);
+        }
+
+        let link = StringBuf::from_slice("/");
+        for (idx, segment) in path.segments.iter().enumerate() {
+            link.extend_from_slice(segment);
+
+            if idx + 1 == path.segments.len() {
+                if item.cfg_index != 0 {
+                    write!(&link, ".{}", item.cfg_index).unwrap();
+                }
+                if item.kind == ItemKind::Module {
+                    link.extend_from_slice("/");
+                } else {
+                    link.extend_from_slice(".html");
+                }
+            } else {
+                link.extend_from_slice("/");
+            }
+        }
+
+        if filename && link.as_slice().ends_with("/") {
+            link.extend_from_slice("index.html");
+        }
+
+        Option::some(link)
+    }
+
+    fn resolve_link(self: &LinkContext, path: &Path, absolute: bool) -> Option<StringBuf> {
+        use std::option::try;
+        let current = if absolute {
+            &Path::root() as &Path
+        } else {
+            self.path
+        };
+        let item = self.item_bag.resolve(current, path, true)?;
+        self.link_for_item(item, true, false)
+    }
+}
+
+struct DoctestWriter {
+    writer: &mut dyn std::io::Writable<Self>,
+    index: usize
+}
+
+impl DoctestWriter {
+    use std::fmt::StreamFormatter;
+
+    fn new(writer: &mut dyn std::io::Writable<Self>) -> DoctestWriter {
+        DoctestWriter {
+            writer: writer,
+            index: 0
+        }
+    }
+
+    fn write_test(self: &mut DoctestWriter, name: &[u8], source: &[u8], no_run: bool, panics: bool, filename: &[u8], line: usize) {
+        use std::fmt::writeln;
+        let fmt = StreamFormatter::new(&self.writer);
+
+        writeln!(&fmt, "#[test]").unwrap();
+        if no_run {
+            writeln!(&fmt, "#[test::ignore]").unwrap();
+        }
+        writeln!(&fmt, "#[location(\"{}\", {})]", filename, line).unwrap();
+        if panics {
+            writeln!(&fmt, "fn test_{}_{}() {{ ::test::assert_panics!({{", name, self.index).unwrap();
+        } else {
+            writeln!(&fmt, "fn test_{}_{}() {{", name, self.index).unwrap();
+        }
+        writeln!(&fmt, "{}", source).unwrap();
+        if panics {
+            writeln!(&fmt, "}});").unwrap();
+        }
+        writeln!(&fmt, "}}").unwrap();
+        writeln!(&fmt, "").unwrap();
+
+        self.index += 1;
+    }
+}

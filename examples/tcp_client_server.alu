@@ -1,0 +1,104 @@
+//! A line numbering service
+
+use std::net::{
+    NameLookup, TcpStream, TcpListener, Shutdown,
+    SocketAddr, buffered
+};
+use std::collections::Vector;
+use std::io::{lines, Error, StdioStream, copy};
+use std::thread::spawn;
+use std::fmt::{write, writeln, pad_with};
+
+const PORT: u16 = 24601;
+
+fn client() -> Result<(), Error> {
+    let addresses = NameLookup::resolve("localhost", PORT)?;
+    defer addresses.free();
+
+    // Take the first address
+    let address = addresses.next()
+        .ok_or(Error::custom("cannot resolve the address"))?;
+
+    let socket = TcpStream::connect(&address)?;
+    defer socket.close();
+
+    // We send to the socket in a separate thread to avoid buffers
+    // getting full.
+    let reader = spawn(|&socket| -> Result<(), Error> {
+        copy(&StdioStream::stdin(), &socket)?;
+        socket.shutdown(Shutdown::Write)?;
+        Result::ok(())
+    });
+    defer reader.join().unwrap()?;
+
+    copy(&socket, &StdioStream::stdout())?;
+
+    Result::ok(())
+}
+
+fn handle_connection(socket: TcpStream) -> Result<(), Error> {
+    defer socket.close();
+
+    // "Split" the socket into a buffered reader and writer pair
+    let (reader, writer) = socket.buffered(1024, 1024);
+    defer reader.free();
+    defer writer.free();
+
+    let lines_iter = reader.lines();
+    defer lines_iter.free();
+
+    for (idx, maybe_line) in lines_iter.enumerate() {
+        writeln!(&writer, "{} | {}", (idx + 1).pad_with(5, ' '), maybe_line?)
+            .map_err(|_: std::fmt::Error| -> Error { Error::custom("failed to write to socket") } )?;
+    }
+
+    writer.flush()?;
+    socket.shutdown(Shutdown::Write)?;
+
+    Result::ok(())
+}
+
+fn server() -> Result<!, Error> {
+    let addr = SocketAddr::parse("[::]:24601").unwrap();
+    let listener = TcpListener::bind(&addr)?;
+    defer listener.close();
+
+    println!("Listening on {}", listener.socket_addr()?);
+
+    loop {
+        let (socket, addr) = listener.accept()?;
+
+        println!("Received a connection from {}", addr);
+
+        // Spawn a new thread for handling the connection
+        spawn(|=socket| {
+            let ret = handle_connection(socket);
+            if ret.is_err() {
+                eprintln!("error while reading from socket: {}", ret.unwrap_err());
+            }
+        })
+        .detach();
+    }
+}
+
+fn main(args: &[&[u8]]) -> i32 {
+    // Mask sigpipe
+    libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+
+    macro usage() {
+        eprintln!("usage: {} [--server|--client]", args[0]);
+        return 1;
+    }
+
+    if args.len() != 2 {
+        usage!()
+    }
+
+    switch args[1] {
+        "--server" => server().unwrap(),
+        "--client" => client().unwrap(),
+        _ => usage!()
+    };
+
+    0
+}

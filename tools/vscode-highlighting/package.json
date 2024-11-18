@@ -1,0 +1,41 @@
+{
+  "name": "alumina",
+  "displayName": "Alumina",
+  "description": "Language support for Alumina programming language",
+  "icon": "images/icon.png",
+  "publisher": "tibordp",
+  "version": "0.0.5",
+  "engines": {
+    "vscode": "^1.63.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "alumina",
+        "aliases": [
+          "Alumina",
+          "alumina"
+        ],
+        "extensions": [
+          ".alu"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "alumina",
+        "scopeName": "source.alumina",
+        "path": "./syntaxes/alumina.tmLanguage.json"
+      }
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alumina-lang/alumina.git"
+  },
+  "homepage": "https://github.com/alumina-lang/alumina"
+}
